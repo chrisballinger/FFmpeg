@@ -274,8 +274,8 @@ External library support:
   --enable-openssl         enable openssl, needed for https support
                            if gnutls is not used [no]
   --disable-sdl            disable sdl [autodetect]
-  --disable-securetransport disable Secure Transport, needed for TLS support
-                           on OSX if openssl and gnutls are not used [autodetect]
+  --enable-securetransport enable Secure Transport, needed for TLS support
+                           on OSX if openssl and gnutls are not used [no]
   --enable-x11grab         enable X11 grabbing (legacy) [no]
   --disable-xlib           disable xlib [autodetect]
   --disable-zlib           disable zlib [autodetect]
