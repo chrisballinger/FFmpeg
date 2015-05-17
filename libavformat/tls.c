@@ -52,7 +52,26 @@
         if ((c)->ctx) \
             SSL_CTX_free((c)->ctx); \
     } while (0)
+#elif CONFIG_SECURETRANSPORT
+#include "libavutil/base64.h"
+#include "libavformat/subtitles.h"
+
+#include <Security/Security.h>
+#include <Security/SecureTransport.h>
+#include <CoreFoundation/CoreFoundation.h>
+// We use a private API call here; it's good enough for WebKit.
+SecIdentityRef SecIdentityCreate(CFAllocatorRef allocator, SecCertificateRef certificate, SecKeyRef privateKey);
+
+#define ioErr -36
+#define TLS_shutdown(c) SSLClose((c)->ssl_context)
+#define TLS_free(c) do { \
+        if ((c)->ssl_context) \
+            CFRelease((c)->ssl_context); \
+        if ((c)->ca_array) \
+            CFRelease((c)->ca_array); \
+    } while (0)
 #endif
+
 #if HAVE_POLL_H
 #include <poll.h>
 #endif
@@ -66,6 +85,9 @@ typedef struct TLSContext {
 #elif CONFIG_OPENSSL
     SSL_CTX *ctx;
     SSL *ssl;
+#elif CONFIG_SECURETRANSPORT
+    SSLContextRef ssl_context;
+    CFArrayRef ca_array;
 #endif
     int fd;
     char *ca_file;
@@ -125,6 +147,18 @@ static int do_tls_poll(URLContext *h, int ret)
         av_log(h, AV_LOG_ERROR, "%s\n", ERR_error_string(ERR_get_error(), NULL));
         return AVERROR(EIO);
     }
+#elif CONFIG_SECURETRANSPORT
+    switch (ret) {
+    case errSSLWouldBlock:
+        break;
+    case errSSLXCertChainInvalid:
+        av_log(h, AV_LOG_ERROR, "Invalid certificate chain\n");
+        return AVERROR(EIO);
+    default:
+        av_log(h, AV_LOG_ERROR, "IO Error: %i\n", ret);
+        return AVERROR(EIO);
+    }
+    p.events = POLLIN | POLLOUT;
 #endif
     if (h->flags & AVIO_FLAG_NONBLOCK)
         return AVERROR(EAGAIN);
@@ -162,6 +196,197 @@ static void set_options(URLContext *h, const char *uri)
     if (!c->key_file && av_find_info_tag(buf, sizeof(buf), "key", p))
         c->key_file = av_strdup(buf);
 }
+
+#if CONFIG_SECURETRANSPORT
+static int import_pem(URLContext *h, char *path, CFArrayRef *array)
+{
+    AVIOContext *s = NULL;
+    CFDataRef data = NULL;
+    int64_t ret = 0;
+    char *buf = NULL;
+    SecExternalFormat format = kSecFormatPEMSequence;
+    SecExternalFormat type = kSecItemTypeAggregate;
+    CFStringRef pathStr = CFStringCreateWithCString(NULL, path, 0x08000100);
+    if (!pathStr) {
+        ret = AVERROR(ENOMEM);
+        goto end;
+    }
+
+    if ((ret = avio_open2(&s, path, AVIO_FLAG_READ,
+                          &h->interrupt_callback, NULL)) < 0)
+        goto end;
+
+    if ((ret = avio_size(s)) < 0)
+        goto end;
+
+    if (ret == 0) {
+        ret = AVERROR_INVALIDDATA;
+        goto end;
+    }
+
+    if (!(buf = av_malloc(ret))) {
+        ret = AVERROR(ENOMEM);
+        goto end;
+    }
+
+    if ((ret = avio_read(s, buf, ret)) < 0)
+        goto end;
+
+    data = CFDataCreate(kCFAllocatorDefault, buf, ret);
+
+    if (SecItemImport(data, pathStr, &format, &type,
+                      0, NULL, NULL, array) != noErr || !array) {
+        ret = AVERROR_UNKNOWN;
+        goto end;
+    }
+
+    if (CFArrayGetCount(*array) == 0) {
+        ret = AVERROR_INVALIDDATA;
+        goto end;
+    }
+
+end:
+    if (pathStr)
+        CFRelease(pathStr);
+    if (data)
+        CFRelease(data);
+    if (s)
+        avio_close(s);
+    return ret;
+}
+
+static int load_ca(URLContext *h)
+{
+    TLSContext *c = h->priv_data;
+    int ret = 0;
+    CFArrayRef array = NULL;
+
+    if ((ret = import_pem(h, c->ca_file, &array)) < 0)
+        goto end;
+
+    if (!(c->ca_array = CFRetain(array))) {
+        ret = AVERROR(ENOMEM);
+        goto end;
+    }
+
+end:
+    if (array)
+        CFRelease(array);
+    return ret;
+}
+
+static int load_cert(URLContext *h)
+{
+    TLSContext *c = h->priv_data;
+    int ret = 0;
+    CFArrayRef array = NULL;
+    CFArrayRef keyArray = NULL;
+    SecIdentityRef id = NULL;
+    CFMutableArrayRef outArray = NULL;
+
+    if ((ret = import_pem(h, c->cert_file, &array)) < 0)
+        goto end;
+
+    if ((ret = import_pem(h, c->key_file, &keyArray)) < 0)
+        goto end;
+
+    if (!(id = SecIdentityCreate(kCFAllocatorDefault,
+                                 CFArrayGetValueAtIndex(array, 0),
+                                 CFArrayGetValueAtIndex(keyArray, 0)))) {
+        ret = AVERROR_UNKNOWN;
+        goto end;
+    }
+
+    if (!(outArray = CFArrayCreateMutableCopy(kCFAllocatorDefault, 0, array))) {
+        ret = AVERROR(ENOMEM);
+        goto end;
+    }
+
+    CFArraySetValueAtIndex(outArray, 0, id);
+
+    SSLSetCertificate(c->ssl_context, outArray);
+
+end:
+    if (array)
+        CFRelease(array);
+    if (keyArray)
+        CFRelease(keyArray);
+    if (outArray)
+        CFRelease(outArray);
+    if (id)
+        CFRelease(id);
+    return ret;
+}
+
+static OSStatus tls_read_cb(SSLConnectionRef connection, void *data, size_t *dataLength)
+{
+    URLContext *h = (URLContext*)connection;
+    TLSContext *c = h->priv_data;
+    int read = ffurl_read_complete(c->tcp, data, *dataLength);
+    if (read <= 0) {
+        *dataLength = 0;
+        switch(AVUNERROR(read)) {
+            case ENOENT:
+            case 0:
+                return errSSLClosedGraceful;
+            case ECONNRESET:
+                return errSSLClosedAbort;
+            case EAGAIN:
+                return errSSLWouldBlock;
+            default:
+                return ioErr;
+        }
+    } else {
+        *dataLength = read;
+        return noErr;
+    }
+}
+
+static OSStatus tls_write_cb(SSLConnectionRef connection, const void *data, size_t *dataLength)
+{
+    URLContext *h = (URLContext*)connection;
+    TLSContext *c = h->priv_data;
+    int written = ffurl_write(c->tcp, data, *dataLength);
+    if (written <= 0) {
+        *dataLength = 0;
+        switch(AVUNERROR(written)) {
+            case EAGAIN:
+                return errSSLWouldBlock;
+            default:
+                return ioErr;
+        }
+    } else {
+        *dataLength = written;
+        return noErr;
+    }
+}
+
+static int TLS_read(TLSContext *c, uint8_t *buf, int size)
+{
+    size_t processed;
+    OSStatus status = SSLRead(c->ssl_context, buf, size, &processed);
+    switch (status) {
+    case noErr:
+        return processed;
+    case errSSLClosedGraceful:
+    case errSSLClosedNoNotify:
+        return 0;
+    default:
+        return (int)status;
+    }
+}
+static int TLS_write(TLSContext *c, const uint8_t *buf, int size)
+{
+    size_t processed;
+    OSStatus status = SSLWrite(c->ssl_context, buf, size, &processed);
+    switch (status) {
+    case noErr:
+        return processed;
+    default:
+        return (int)status;
+    }
+}
+#endif
 
 static int tls_open(URLContext *h, const char *uri, int flags, AVDictionary **options)
 {
@@ -341,6 +566,82 @@ static int tls_open(URLContext *h, const char *uri, int flags, AVDictionary **op
             goto fail;
         }
         if ((ret = do_tls_poll(h, ret)) < 0)
+            goto fail;
+    }
+#elif CONFIG_SECURETRANSPORT
+    #define CHECK_ERROR(func, ...) do { \
+        OSStatus status = func(__VA_ARGS__); \
+        if (status != noErr) { \
+            ret = AVERROR_UNKNOWN; \
+            av_log(h, AV_LOG_ERROR, #func ": Error %i\n", (int)status); \
+            goto fail; \
+        } \
+    } while (0)
+    c->ssl_context = SSLCreateContext(NULL, c->listen ? kSSLServerSide : kSSLClientSide, kSSLStreamType);
+    if (!c->ssl_context) {
+        av_log(h, AV_LOG_ERROR, "Unable to create SSL context\n");
+        ret = AVERROR(ENOMEM);
+        goto fail;
+    }
+    set_options(h, uri);
+    if (c->ca_file) {
+        if ((ret = load_ca(h)) < 0)
+            goto fail;
+        CHECK_ERROR(SSLSetSessionOption, c->ssl_context, kSSLSessionOptionBreakOnServerAuth, true);
+    }
+    if (c->cert_file)
+        if ((ret = load_cert(h)) < 0)
+            goto fail;
+    if (c->verify)
+        CHECK_ERROR(SSLSetPeerDomainName, c->ssl_context, host, strlen(host));
+    CHECK_ERROR(SSLSetIOFuncs, c->ssl_context, tls_read_cb, tls_write_cb);
+    CHECK_ERROR(SSLSetConnection, c->ssl_context, h);
+    while (1) {
+        OSStatus status = SSLHandshake(c->ssl_context);
+        if (status == errSSLServerAuthCompleted) {
+            SecTrustRef peerTrust;
+            SecTrustResultType trustResult;
+            if (!c->verify)
+                continue;
+
+            if (SSLCopyPeerTrust(c->ssl_context, &peerTrust) != noErr) {
+                ret = AVERROR(ENOMEM);
+                goto fail;
+            }
+
+            if (SecTrustSetAnchorCertificates(peerTrust, c->ca_array) != noErr) {
+                ret = AVERROR_UNKNOWN;
+                goto fail;
+            }
+
+            if (SecTrustEvaluate(peerTrust, &trustResult) != noErr) {
+                ret = AVERROR_UNKNOWN;
+                goto fail;
+            }
+
+            if (trustResult == kSecTrustResultProceed ||
+                trustResult == kSecTrustResultUnspecified) {
+                // certificate is trusted
+                status = errSSLWouldBlock; // so we call SSLHandshake again
+            } else if (trustResult == kSecTrustResultRecoverableTrustFailure) {
+                // not trusted, for some reason other than being expired
+                status = errSSLXCertChainInvalid;
+            } else {
+                // cannot use this certificate (fatal)
+                status = errSSLBadCert;
+            }
+
+            if (peerTrust)
+                CFRelease(peerTrust);
+        }
+        if (status == noErr)
+            break;
+        if (status != errSSLWouldBlock) {
+            av_log(h, AV_LOG_ERROR, "Unable to negotiate TLS/SSL session: %i\n", (int)status);
+            ret = AVERROR(EIO);
+            goto fail;
+        }
+        if ((ret = do_tls_poll(h, status)) < 0)
             goto fail;
     }
 #endif
